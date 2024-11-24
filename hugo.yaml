@@ -27,18 +27,21 @@ params:
   env: production
   description: ""
   author: Theme PaperMod
-  defaultTheme: auto
+  defaultTheme: dark
   ShowShareButtons: true
+  ShareButtons: ["linkedin", "twitter"] # To customize which share buttons to be enabled on page
+  ShowCodeCopyButtons: true
   ShowReadingTime: true
   displayFullLangName: true
   ShowPostNavLinks: true
   ShowBreadCrumbs: true
-  ShowCodeCopyButtons: true
+  ShowWordCount: true
   ShowRssButtonInSectionTermList: true
   ShowAllPagesInArchive: true
   ShowPageNums: true
   ShowToc: true
   images: ["images/papermod-cover.png"]
+  comments: true
 
   homeInfoParams:
     Title: "Abdulsamet İleri"
