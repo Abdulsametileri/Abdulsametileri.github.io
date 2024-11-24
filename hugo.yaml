@@ -50,6 +50,10 @@ params:
       
       - I am working on as Trendyol as Senior Software Engineer.
 
+  analytics:
+    google:
+      SiteVerificationTag: G-6KKCPG75GY
+
   socialIcons:
     - name: github
       url: "https://github.com/Abdulsametileri"
