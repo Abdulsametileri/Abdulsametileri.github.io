@@ -2,3 +2,59 @@ baseURL: https://abdulsametileri.github.io/
 languageCode: en-us
 title: Abdulsamet's Blog
 theme: ["PaperMod"]
+
+languages:
+  en:
+    languageName: "English"
+    weight: 1
+    taxonomies:
+      category: categories
+      tag: tags
+      series: series
+    menu:
+      main:
+        - name: Archive
+          url: archives
+          weight: 5
+        - name: Search
+          url: search/
+          weight: 10
+        - name: Tags
+          url: tags/
+          weight: 10
+
+params:
+  env: production
+  description: ""
+  author: Theme PaperMod
+  defaultTheme: auto
+  ShowShareButtons: true
+  ShowReadingTime: true
+  displayFullLangName: true
+  ShowPostNavLinks: true
+  ShowBreadCrumbs: true
+  ShowCodeCopyButtons: true
+  ShowRssButtonInSectionTermList: true
+  ShowAllPagesInArchive: true
+  ShowPageNums: true
+  ShowToc: true
+  images: ["images/papermod-cover.png"]
+
+  homeInfoParams:
+    Title: "Abdulsamet İleri"
+    Content: >
+      - 👋 Hi, I am Abdulsamet. Welcome to my blog page
+      
+      - I am working on as Trendyol as Senior Software Engineer.
+
+  socialIcons:
+    - name: github
+      url: "https://github.com/Abdulsametileri"
+    - name: Linkedin
+      url: "https://www.linkedin.com/in/abdulsamet-ileri-839222121/"
+    - name: Medium
+      url: "https://medium.com/@abdulsamet-ileri"
+    - name: X
+      url: "https://x.com/AbdulsametIler3"
+    - name: buymeacoffee
+      url: "https://buymeacoffee.com/sametilerif"
