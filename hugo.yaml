@@ -52,7 +52,7 @@ params:
 
   analytics:
     google:
-      SiteVerificationTag: G-6KKCPG75GY
+      SiteVerificationTag: "G-6KKCPG75GY"
 
   socialIcons:
     - name: github
