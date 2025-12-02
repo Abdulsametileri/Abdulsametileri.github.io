@@ -1,22 +1,22 @@
 ---
-title: "How we implement Debezium style initial data (snapshot) progress in our postgresql cdc library"
+title: "How We Implement Debezium Style Initial Data (Snapshot) Progress in Our PostgreSQL CDC Library"
 date: "2025-11-30"
-description: ""
-summary: ""
+description: "Learn how to implement snapshot functionality in PostgreSQL CDC libraries using a coordinator/worker model with metadata tables for progress tracking."
+summary: "A deep dive into implementing Debezium-style initial data capture with horizontal scaling support in go-pq-cdc library."
 tags: [ "go", "postgresql" ]
 categories: [ "go", "postgresql" ]
 draft: true
 ---
 
-> In this article, we will talk about how we implement snapshot mode to our [go-pq-cdc](https://github.com/Trendyol/go-pq-cdc) library and how it works under the hood.
+> In this article, we will discuss how we implement snapshot mode in our [go-pq-cdc](https://github.com/Trendyol/go-pq-cdc) library and how it works under the hood.
 
 ## What is go-pq-cdc?
 
-* [go-pq-cdc](https://github.com/Trendyol/go-pq-cdc) is our PostgreSQL CDC _(Change Data Capture)_ library. It is based on [postgresql' logical replication protocol](https://www.postgresql.org/docs/current/logical-replication.html). It's a [Debezium](https://debezium.io/) alternative but in better way in terms of resource consumption and performance [benchmarks](https://github.com/Trendyol/go-pq-cdc/tree/main/benchmark).
+* [go-pq-cdc](https://github.com/Trendyol/go-pq-cdc) is our PostgreSQL CDC _(Change Data Capture)_ library. It is based on [PostgreSQL's logical replication protocol](https://www.postgresql.org/docs/current/logical-replication.html). It's a [Debezium](https://debezium.io/) alternative but in a better way in terms of resource consumption and performance [benchmarks](https://github.com/Trendyol/go-pq-cdc/tree/main/benchmark).
 
-* CDC version of this library is used in production for a year. Thanks to [Serhat Karabulut](https://www.linkedin.com/in/serhat-karabulut/). He writes this project and supported a lot for all process.
+* The CDC version of this library has been used in production for a year. Thanks to [Serhat Karabulut](https://www.linkedin.com/in/serhat-karabulut/). He wrote this project and provided significant support throughout the entire process.
 
-* PostgreSQL to [Kafka](https://github.com/Trendyol/go-pq-cdc-kafka) and [Elasticsearch](https://github.com/Trendyol/go-pq-cdc-elasticsearch) also available and used in production.
+* PostgreSQL to [Kafka](https://github.com/Trendyol/go-pq-cdc-kafka) and [Elasticsearch](https://github.com/Trendyol/go-pq-cdc-elasticsearch) connectors are also available and used in production.
 
 ## What is logical replication? 
 
@@ -131,7 +131,7 @@ defer connector.Close()
 connector.Start(ctx)
 ```
 
-### Handler Function
+#### Handler Function
 
 Subscribe to changes by providing a handler function that processes different message types:
 
@@ -163,7 +163,7 @@ The **Snapshot Feature** enables **initial data capture** from PostgreSQL tables
 1. **Existing data** (via snapshot)
 2. **Real-time changes** (via CDC)
 
-Without snapshot support, CDC only captures changes that occur *after* the replication slot is created, missing all pre-existing data.
+Without snapshot support, CDC only captures changes that occur **after the replication slot is created**, missing all pre-existing data.
 
 There are three snapshot mode options available:
 
@@ -171,13 +171,17 @@ There are three snapshot mode options available:
 - **snapshot_only:** Take snapshot and exit _(no CDC, no replication slot required)_.
 - **never:** Skip snapshot, start CDC immediately. This is the default behavior.
 
-Let's see how it's used.
+We are using **coordinator/worker** model and **two metadata tables** during snapshot process. We will get into the details later.
+
+Let's see how it's used first.
 
 ### How snapshot mode 'Initial' is used
 
-Full example [here](https://github.com/Trendyol/go-pq-cdc/tree/main/example/basic-snapshot-initial-mode).
+Full example [here](https://github.com/Trendyol/go-pq-cdc/tree/main/example/snapshot-initial-mode).
 
-### Configuration
+We have `users` table. `1000` users exist. 
+
+#### Configuration
 
 ```go
 cfg := config.Config{
@@ -228,7 +232,7 @@ defer connector.Close()
 connector.Start(ctx)
 ```
 
-### Handler Function
+#### Handler Function
 
 Subscribe to snapshot and changes by providing a handler function that processes different message types:
 
@@ -267,16 +271,69 @@ func handleSnapshot(s *format.Snapshot) {
 }
 ```
 
-> We are exposing snapshot begin and end marker for better control.
+> We are exposing snapshot begin and end marker for better control during snapshot process.
 
 > Note: There is no ACK process in snapshot. `ctx.Ack()` does nothing, returns nil.
 
+### Monitoring
+
+There are two metadata tables.
+
+- **cdc_snapshot_job**: Metadata table for snapshot process tracking
+![CDC Snapshot Job Table](images/cdc_snapshot_job.png)
+
+- **cdc_snapshot_chunks**: Each chunk represents work to be done
+![CDC Snapshot Chunks Table](images/cdc_snapshot_chunks.png)
+
+  - `chunk_start` and `chunk_end`: Used for **non-numeric** primary keys with `LIMIT/OFFSET` queries
+  - `range_start` and `range_end`: Used for **numeric** primary keys with range-based `WHERE` clauses for better performance
+  ```go
+  func (s *Snapshotter) buildChunkQuery(chunk *Chunk, orderByClause string, pkColumns []string) string {
+      if chunk.hasRangeBounds() && len(pkColumns) == 1 {
+          pkColumn := pkColumns[0]
+  
+          return fmt.Sprintf(
+              "SELECT * FROM %s.%s WHERE %s >= %d AND %s <= %d ORDER BY %s LIMIT %d",
+              chunk.TableSchema,
+              chunk.TableName,
+              pkColumn,
+              *chunk.RangeStart,
+              pkColumn,
+              *chunk.RangeEnd,
+              orderByClause,
+              chunk.ChunkSize,
+          )
+      }
+  
+      return fmt.Sprintf(
+          "SELECT * FROM %s.%s ORDER BY %s LIMIT %d OFFSET %d",
+          chunk.TableSchema,
+          chunk.TableName,
+          orderByClause,
+          chunk.ChunkSize,
+          chunk.ChunkStart,
+      )
+  }
+  ``` 
+  - `claimed_by`: Shows which instance is responsible for that chunk
+  - `claimed_at`: Shows when the instance was assigned to the chunk
+  - `heartbeat_at`: Instance heartbeat updates, so we can determine if it's alive or not. If the heartbeat stops, after `claimTimeout` passes, the chunk is released and a new instance is assigned. You can control this via
+  ```go
+  Snapshot: config.SnapshotConfig{
+      ...
+      ClaimTimeout:      30 * time.Second, <-- timeout to reclaim stale chunks
+      HeartbeatInterval: 5 * time.Second, <-- heartbeat at every 5 sec
+  }
+  ```
+
 ### How snapshot mode 'Snapshot Only' is used
 
-Full example [here](https://github.com/Trendyol/go-pq-cdc/tree/main/example/basic-snapshot-only-mode).
+Full example [here](https://github.com/Trendyol/go-pq-cdc/tree/main/example/snapshot-only-mode).
 
-### Configuration
-- No need to provide slot, publication etc. 
+We have `users` table. `100` users exist.
+
+#### Configuration
+- **Note**: No need to provide slot or publication configuration for snapshot-only mode 
 
 ```go
 cfg := config.Config{
@@ -313,7 +370,7 @@ defer connector.Close()
 connector.Start(ctx)
 ```
 
-### Handler Function
+#### Handler Function
 
 Subscribe to snapshot messages by providing a handler function:
 
@@ -338,12 +395,25 @@ func Handler(ctx *replication.ListenerContext) {
 }
 ```
 
+### Scaling Snapshot Process
 
-### Roadmap
+We can easily scale in horizontal during the snapshot process. 
+
+Full example [here](https://github.com/Trendyol/go-pq-cdc/tree/main/example/snapshot-with-scaling).
+
+There is no specific configuration or handling required in the codebase for scaling.
+
+Let's play with it by scaling to 3 containers `docker-compose up --scale go-pq-cdc=3 -d`
+
+![instance_1](images/instance-1.png)
+![instance_2](images/instance-2.png)
+![instance_3](images/instance-3.png)
+![chunk status multiple instance](images/chunk-status-multiple-instance.png)
+
+### Roadmap
 ---
 
 
-snapshot scale? <-- TODO
 repeatable read transaction level
 pg export snapshot
 pg_current_wal_lsn() 
