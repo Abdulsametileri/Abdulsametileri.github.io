@@ -580,9 +580,11 @@ If coordinator closed transaction early:
   ❌ Data inconsistency across chunks
   ❌ All snapshot process is aborted. It will start to take new snapshot!
 
-> Because the coordinator holds a long‑running REPEATABLE READ transaction, old row versions must be kept until the snapshot finishes. For most initial‑load scenarios this is acceptable, but you should be aware of the potential for extra bloat while a long snapshot is running.
-
 ```
+
+> Because the coordinator holds a long‑running REPEATABLE READ transaction, old row versions must be kept until the 
+> snapshot finishes. For most initial‑load scenarios this is acceptable, but you should be aware of the potential 
+> for extra bloat while a long snapshot is running.
 
 ### How We Ensure No Data Is Missed
 
