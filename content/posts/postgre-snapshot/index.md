@@ -4,11 +4,11 @@ date: "2025-11-30"
 description: "Learn how to implement snapshot functionality in PostgreSQL CDC libraries using a coordinator/worker model with metadata tables for progress tracking."
 summary: "A deep dive into implementing Debezium-style initial data capture with horizontal scaling support in go-pq-cdc library."
 tags: [ "go", "postgresql" ]
-categories: [ "go", "postgresql" ]
-draft: true
+categories: [ "go", "postgresql", "cdc", "debezium" ]
+draft: false
 ---
 
--  In this article, we’ll look at how we implemented snapshot mode in our [go-pq-cdc](https://github.com/Trendyol/go-pq-cdc) PostgreSQL CDC library, and how it works under the hood.
+In this article, we’ll look at how we implemented snapshot mode in our [go-pq-cdc](https://github.com/Trendyol/go-pq-cdc) PostgreSQL CDC library, and how it works under the hood.
 
 ## What is go-pq-cdc?
 
@@ -201,13 +201,20 @@ Result: You get all 1M + 10 rows, with no duplicates!
 
 There are three snapshot mode options available:
 
-- **initial:** Take a snapshot once (only if no previous snapshot exists), then continue with CDC from that point. 
-- **snapshot_only:** Take a snapshot and then exit. No CDC and no publication/replication slot are used.
-- **never:** Do not take a snapshot; start CDC immediately from the replication slot’s position. (default)
+- **`initial`** Take a snapshot once (only if no previous snapshot exists), then continue with CDC from that point. 
+- **`snapshot_only`**: Take a snapshot and then exit. No CDC and no publication/replication slot are used.
+- **`never`**: Do not take a snapshot; start CDC immediately from the replication slot’s position. (default)
 
 Internally, the snapshot process uses a **coordinator/worker** model and **two metadata tables** to track progress. We will get into the details later.
 
 Let's see how it's used first.
+
+### Quick Start (How to Use Snapshot in go-pq-cdc)
+
+- **Enable snapshot**: Set `snapshot.enabled = true` and choose a `mode` (`initial`, `snapshot_only`, or `never`).
+- **Configure tables**: Use `publication.tables` (for `initial`) or `snapshot.tables` (for `snapshot_only`) to list the tables you want.
+- **Handle events**: In your handler, process `*format.Snapshot` events (`Begin`, `Data`, `End`) alongside normal CDC events.
+- **CDC continuation**: In `initial` mode, once snapshot is done, CDC automatically continues from the captured LSN — no gaps, no duplicates.
 
 ### How snapshot mode 'Initial' is used
 
@@ -323,7 +330,7 @@ There are two metadata tables.
   - `chunk_start` and `chunk_end`: Used for **non-numeric** primary keys with `LIMIT/OFFSET` queries
   - `range_start` and `range_end`: Used for **numeric** primary keys with range-based `WHERE` clauses for better performance
  
-    > Range scanning on a numeric PK is not only faster than LIMIT/OFFSET but also avoids performance degradation as the offset grows. 
+  > Range scanning on a numeric PK is not only faster than LIMIT/OFFSET but also avoids performance degradation as the offset grows. 
  
   ```go
   func (s *Snapshotter) buildChunkQuery(chunk *Chunk, orderByClause string, pkColumns []string) string {
@@ -352,10 +359,9 @@ There are two metadata tables.
           chunk.ChunkStart,
       )
   }
+  ```   
+    > Currently we only use range bounds when there is a single numeric primary key; composite keys fall back to LIMIT/OFFSET chunking.
 
-  Currently we only use range bounds when there is a single numeric 
-  primary key; composite keys fall back to LIMIT/OFFSET chunking.
-  ``` 
   - `claimed_by`: Shows which instance is responsible for that chunk
   - `claimed_at`: Shows when the instance was assigned to the chunk
   - `heartbeat_at`: Instance heartbeat updates, so we can determine if it's alive or not. If the heartbeat stops, after `claimTimeout` passes, the chunk is released and a new instance is assigned. You can control this via
@@ -453,7 +459,7 @@ Let's play with it by scaling to 3 containers `docker-compose up --scale go-pq-c
 
 ## Snapshot Architecture Basics (How It Works Internally)
 
-> The rest of this article explains how we implemented snapshotting under the hood. You don’t need this part to use the feature, but it’s useful if you care about the internals or want to adapt the design.”
+> The rest of this article explains how we implemented snapshotting under the hood. You don’t need this part to use the feature, but it’s useful if you care about the internals or want to adapt the design.
 
 Before we walk through the snapshot lifecycle, we need to explain a couple of concepts.
 
@@ -522,7 +528,7 @@ the duration of that transaction, preventing non-repeatable reads. Let's examine
 
 **Key Point**: Transaction A always reads from the data **as it was at T1**, regardless of B's commit at T5. This is how we ensure all instances read a consistent, frozen view of the data during the entire snapshot.
 
-In our library, Coordinator exports a PostgreSQL snapshot and keeps it open during snapshot process:
+In our library, the coordinator exports a PostgreSQL snapshot and keeps it open during the snapshot process:
 
 ```go
 // 1. Start transaction (REPEATABLE READ for consistency)
@@ -542,8 +548,9 @@ WHERE slot_name = 'cdc_slot'
 ```
 
 **Why?** Because when we are using multiple instances, we need to ensure that all instances see same snapshot of the data.
-By exporting the snapshot of the coordinator transaction by using `pg_export_snapshot()`, workers can easily get this from `cdc_snapshot_job`
-and set their transactions so we provide transactional consistency.
+
+By exporting the coordinator transaction’s snapshot using `pg_export_snapshot()`, workers can read this value from `cdc_snapshot_job`
+and set their own transactions to it, so we provide transactional consistency.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -581,9 +588,13 @@ If coordinator closed transaction early:
 
 How do we ensure no data is missed between snapshot and CDC process?
 
-Before starting the snapshot, we capture current lsn with `pg_current_wal_lsn`.
-The single value returned by SELECT pg_current_wal_lsn() represents the absolute location of the last point the primary server has written to the Write-Ahead Log (WAL).
+Before starting the snapshot, we capture the current LSN with `pg_current_wal_lsn()`.
 
+The single value returned by `SELECT pg_current_wal_lsn()` represents the absolute location of the last point the primary server has written to the Write-Ahead Log (WAL).
+
+We use this value as the starting LSN when we start the replication slot stream:
+
+`START_REPLICATION SLOT cdc_slot LOGICAL 0/12345678`
 
 ```
 Timeline:
@@ -600,10 +611,6 @@ Timeline:
          │◄───────────────────┤                    │
          No overlap!    CDC starts from snapshot LSN
 ```
-
-We are using this value in the slot stream start
-
-`START_REPLICATION SLOT cdc_slot LOGICAL 0/12345678`
 
 Simply, all rows selected during snapshot are guaranteed to be visible as of the snapshot’s MVCC view; any later changes will appear as logical replication events after we start CDC at the stored LSN.
 
@@ -683,9 +690,9 @@ After Restart (30s later):
   C2 becomes stale → reclaimed by healthy instance
 ```
 
-When worker is live, it resumes from where it left off - completed chunks are skipped, pending chunks are processed.
-
 **Coordinator Crash Before Export**: Incomplete job is detected on restart. The system cleans up and **restarts snapshot from scratch**.
+
+When a worker (or a new instance) comes back, processing resumes from where it left off — completed chunks are skipped, pending chunks are processed.
 
 ---
 
@@ -699,5 +706,7 @@ The Snapshot Feature provides a robust, scalable solution for initial data captu
 - ✅ **Observable**: Metadata tables for progress tracking
 
 For more details, check out the [go-pq-cdc repository](https://github.com/Trendyol/go-pq-cdc).
+
+> Thank you for reading!
 
 ---
