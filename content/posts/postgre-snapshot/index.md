@@ -8,15 +8,18 @@ categories: [ "go", "postgresql" ]
 draft: true
 ---
 
-> In this article, we will discuss how we implement snapshot mode in our [go-pq-cdc](https://github.com/Trendyol/go-pq-cdc) library and how it works under the hood.
+-  In this article, we’ll look at how we implemented snapshot mode in our [go-pq-cdc](https://github.com/Trendyol/go-pq-cdc) PostgreSQL CDC library, and how it works under the hood.
 
 ## What is go-pq-cdc?
 
-* [go-pq-cdc](https://github.com/Trendyol/go-pq-cdc) is our PostgreSQL CDC _(Change Data Capture)_ library. It is based on [PostgreSQL's logical replication protocol](https://www.postgresql.org/docs/current/logical-replication.html). It's a [Debezium](https://debezium.io/) alternative but in a better way in terms of resource consumption and performance [benchmarks](https://github.com/Trendyol/go-pq-cdc/tree/main/benchmark).
+* [go-pq-cdc](https://github.com/Trendyol/go-pq-cdc) is our PostgreSQL CDC _(Change Data Capture)_ library. It is built on top of [PostgreSQL's logical replication protocol](https://www.postgresql.org/docs/current/logical-replication.html). It's a [Debezium](https://debezium.io/) alternative but in a better way in terms of resource consumption and performance [benchmarks](https://github.com/Trendyol/go-pq-cdc/tree/main/benchmark).
 
-* The CDC version of this library has been used in production for a year. Thanks to [Serhat Karabulut](https://www.linkedin.com/in/serhat-karabulut/). He wrote this project and provided significant support throughout the entire process.
+* The CDC part of this library has been running in production for over a year. Thanks to [Serhat Karabulut](https://www.linkedin.com/in/serhat-karabulut/). He wrote this project and provided significant support throughout the entire process.
 
 * PostgreSQL to [Kafka](https://github.com/Trendyol/go-pq-cdc-kafka) and [Elasticsearch](https://github.com/Trendyol/go-pq-cdc-elasticsearch) connectors are also available and used in production.
+
+
+> Before we dive into the snapshot feature, let’s briefly cover a few key PostgreSQL concepts.
 
 ## What is logical replication? 
 
@@ -158,6 +161,8 @@ func Handler(ctx *replication.ListenerContext) {
 
 In database terminology, a snapshot refers to a copy of a database (or table in a database) that is taken at a particular point in time—just like taking a snapshot with a camera ([From Streaming Databases Book](https://www.oreilly.com/library/view/streaming-databases/9781098154820/)).
 
+### Why Do We Need a Snapshot?
+
 The **Snapshot Feature** enables **initial data capture** from PostgreSQL tables before starting Change Data Capture (CDC). This ensures that your downstream systems receive both:
 
 1. **Existing data** (via snapshot)
@@ -165,13 +170,42 @@ The **Snapshot Feature** enables **initial data capture** from PostgreSQL tables
 
 Without snapshot support, CDC only captures changes that occur **after the replication slot is created**, missing all pre-existing data.
 
+Consider this scenario:
+
+```
+Timeline:
+  T0: Table "users" has 1M rows
+  T1: You start go-pq-cdc (CDC only)
+  T2: 10 new rows inserted
+  
+Result: You only get 10 rows, missing the initial 1M rows! ❌
+```
+
+With snapshot enabled:
+
+```
+Timeline:
+  T0: Table "users" has 1M rows
+  T1: You start go-pq-cdc with snapshot enabled
+      - Snapshot captures 1M rows at LSN=X
+      - Replication slot created at LSN=X or LSN=<X
+  T2: 10 new rows inserted (at LSN=Y, Y > X)
+  T3: Snapshot completes, CDC starts from LSN=X
+      - CDC captures the 10 new rows
+  
+Result: You get all 1M + 10 rows, with no duplicates!
+```
+
+> In other words, pure CDC alone can never give you the historical state of the table; it only tells you what changed after you started.
+
+
 There are three snapshot mode options available:
 
-- **initial:** Take snapshot only if no previous snapshot exists, then start CDC. 
-- **snapshot_only:** Take snapshot and exit _(no CDC, no replication slot required)_.
-- **never:** Skip snapshot, start CDC immediately. This is the default behavior.
+- **initial:** Take a snapshot once (only if no previous snapshot exists), then continue with CDC from that point. 
+- **snapshot_only:** Take a snapshot and then exit. No CDC and no publication/replication slot are used.
+- **never:** Do not take a snapshot; start CDC immediately from the replication slot’s position. (default)
 
-We are using **coordinator/worker** model and **two metadata tables** during snapshot process. We will get into the details later.
+Internally, the snapshot process uses a **coordinator/worker** model and **two metadata tables** to track progress. We will get into the details later.
 
 Let's see how it's used first.
 
@@ -252,6 +286,7 @@ func Handler(ctx *replication.ListenerContext) {
 	if err := ctx.Ack(); err != nil {
 		slog.Error("ack", "error", err)
 	}
+}
 
 func handleSnapshot(s *format.Snapshot) {
 	switch s.EventType {
@@ -271,9 +306,9 @@ func handleSnapshot(s *format.Snapshot) {
 }
 ```
 
-> We are exposing snapshot begin and end marker for better control during snapshot process.
+> We expose explicit snapshot begin and end markers so that consumers can control how they handle the snapshot window.
 
-> Note: There is no ACK process in snapshot. `ctx.Ack()` does nothing, returns nil.
+> Note: Snapshot messages are not tied to WAL positions, so `ctx.Ack()` is a no‑op and always returns nil during snapshot.
 
 ### Monitoring
 
@@ -287,6 +322,9 @@ There are two metadata tables.
 
   - `chunk_start` and `chunk_end`: Used for **non-numeric** primary keys with `LIMIT/OFFSET` queries
   - `range_start` and `range_end`: Used for **numeric** primary keys with range-based `WHERE` clauses for better performance
+ 
+    > Range scanning on a numeric PK is not only faster than LIMIT/OFFSET but also avoids performance degradation as the offset grows. 
+ 
   ```go
   func (s *Snapshotter) buildChunkQuery(chunk *Chunk, orderByClause string, pkColumns []string) string {
       if chunk.hasRangeBounds() && len(pkColumns) == 1 {
@@ -314,6 +352,9 @@ There are two metadata tables.
           chunk.ChunkStart,
       )
   }
+
+  Currently we only use range bounds when there is a single numeric 
+  primary key; composite keys fall back to LIMIT/OFFSET chunking.
   ``` 
   - `claimed_by`: Shows which instance is responsible for that chunk
   - `claimed_at`: Shows when the instance was assigned to the chunk
@@ -397,7 +438,7 @@ func Handler(ctx *replication.ListenerContext) {
 
 ### Scaling Snapshot Process
 
-We can easily scale in horizontal during the snapshot process. 
+We can easily scale horizontally during the snapshot process. 
 
 Full example [here](https://github.com/Trendyol/go-pq-cdc/tree/main/example/snapshot-with-scaling).
 
@@ -410,14 +451,253 @@ Let's play with it by scaling to 3 containers `docker-compose up --scale go-pq-c
 ![instance_3](images/instance-3.png)
 ![chunk status multiple instance](images/chunk-status-multiple-instance.png)
 
-### Roadmap
+## Snapshot Architecture Basics (How It Works Internally)
+
+> The rest of this article explains how we implemented snapshotting under the hood. You don’t need this part to use the feature, but it’s useful if you care about the internals or want to adapt the design.”
+
+Before we walk through the snapshot lifecycle, we need to explain a couple of concepts.
+
+### pg_try_advisory_lock()
+
+`pg_try_advisory_lock` is a **non-blocking** function in PostgreSQL. It attempts to acquire an application-level lock 
+using a key you specify. If the lock is already held by another session _(in our case instance)_, the function returns 
+`FALSE` immediately instead of waiting.
+
+```go
+lockID := hashString(slotName)  // e.g., "cdc_slot" -> 12345
+acquired := SELECT pg_try_advisory_lock(lockID)
+```
+
+When multiple instances start simultaneously, they need to elect a coordinator:
+
+```
+Coordinator Election
+───────────────────────────────
+   ┌─────────┐
+   │Instance1│──pg_try_advisory_lock()──► Success (Coordinator)
+   └─────────┘
+   ┌─────────┐
+   │Instance2│──pg_try_advisory_lock()──► Fail (Worker)
+   └─────────┘
+   ┌─────────┐
+   │Instance3│──pg_try_advisory_lock()──► Fail (Worker)
+   └─────────┘
+```
+
+> Advisory locks are automatically released when the connection closes.
+> If you are using PgBouncer, prefer transaction pooling mode here; session mode may cause surprising behavior with advisory locks because connections are reused across sessions.
+
+### Repeatable Read Isolation Level
+
+The `Repeatable Read` isolation level guarantees that any rows a transaction reads will remain unchanged for 
+the duration of that transaction, preventing non-repeatable reads. Let's examine it with an example.
+
+```
+┌──────────┬─────────────────────────────────────┬─────────────────────────────────────┐
+│   Time   │  Transaction A (Repeatable Read)    │  Transaction B (Normal)             │
+├──────────┼─────────────────────────────────────┼─────────────────────────────────────┤
+│    T1    │  BEGIN TRANSACTION ISOLATION        │                                     │
+│          │  LEVEL REPEATABLE READ;             │                                     │
+│          │  → Takes snapshot of data           │                                     │
+├──────────┼─────────────────────────────────────┼─────────────────────────────────────┤
+│    T2    │  SELECT balance FROM Accounts       │                                     │
+│          │  WHERE AccountID = 1;               │                                     │
+│          │  → Result: 500 ₺                    │                                     │
+├──────────┼─────────────────────────────────────┼─────────────────────────────────────┤
+│    T3    │                                     │  BEGIN TRANSACTION;                 │
+├──────────┼─────────────────────────────────────┼─────────────────────────────────────┤
+│    T4    │                                     │  UPDATE Accounts SET balance = 400  │
+│          │                                     │  WHERE AccountID = 1;               │
+├──────────┼─────────────────────────────────────┼─────────────────────────────────────┤
+│    T5    │                                     │  COMMIT; ✓                          │
+│          │                                     │  → 400 ₺ is now permanent           │
+├──────────┼─────────────────────────────────────┼─────────────────────────────────────┤
+│    T6    │  SELECT balance FROM Accounts       │                                     │
+│          │  WHERE AccountID = 1;               │                                     │
+│          │  → Result: 500 ₺ (still!)           │                                     │
+├──────────┼─────────────────────────────────────┼─────────────────────────────────────┤
+│    T7    │  COMMIT;                            │                                     │
+└──────────┴─────────────────────────────────────┴─────────────────────────────────────┘
+```
+
+**Key Point**: Transaction A always reads from the data **as it was at T1**, regardless of B's commit at T5. This is how we ensure all instances read a consistent, frozen view of the data during the entire snapshot.
+
+In our library, Coordinator exports a PostgreSQL snapshot and keeps it open during snapshot process:
+
+```go
+// 1. Start transaction (REPEATABLE READ for consistency)
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ
+
+// 2. Export snapshot
+snapshotID := SELECT pg_export_snapshot()  
+// Returns: "00000003-00000002-1"
+
+// 3. Keep transaction OPEN!
+// (Do NOT commit/rollback yet)
+
+// 4. Update job metadata
+UPDATE cdc_snapshot_job 
+SET snapshot_id = '00000003-00000002-1'
+WHERE slot_name = 'cdc_slot'
+```
+
+**Why?** Because when we are using multiple instances, we need to ensure that all instances see same snapshot of the data.
+By exporting the snapshot of the coordinator transaction by using `pg_export_snapshot()`, workers can easily get this from `cdc_snapshot_job`
+and set their transactions so we provide transactional consistency.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Coordinator Transaction (REPEATABLE READ)                  │
+│  ┌────────────────────────────────────────────────────┐    │
+│  │ BEGIN                                               │    │
+│  │ SELECT pg_export_snapshot() → 'snapshot_123'       │    │
+│  │ ... (transaction stays open) ...                   │    │
+│  │                                                     │    │
+│  │  ┌──────────────────────────────────────────────┐ │    │
+│  │  │ Worker 1: SET TRANSACTION SNAPSHOT 'snap123' │ │    │
+│  │  │ SELECT * FROM users ... (sees same data!)    │ │    │
+│  │  └──────────────────────────────────────────────┘ │    │
+│  │                                                     │    │
+│  │  ┌──────────────────────────────────────────────┐ │    │
+│  │  │ Worker 2: SET TRANSACTION SNAPSHOT 'snap123' │ │    │
+│  │  │ SELECT * FROM orders ... (sees same data!)   │ │    │
+│  │  └──────────────────────────────────────────────┘ │    │
+│  │                                                     │    │
+│  │ COMMIT (after all chunks done)                     │    │
+│  └────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────┘
+
+If coordinator closed transaction early:
+  ❌ Snapshot ID becomes invalid
+  ❌ Workers can't use SET TRANSACTION SNAPSHOT
+  ❌ Data inconsistency across chunks
+  ❌ All snapshot process is aborted. It will start to take new snapshot!
+
+> Because the coordinator holds a long‑running REPEATABLE READ transaction, old row versions must be kept until the snapshot finishes. For most initial‑load scenarios this is acceptable, but you should be aware of the potential for extra bloat while a long snapshot is running.
+
+```
+
+### How We Ensure No Data Is Missed
+
+How do we ensure no data is missed between snapshot and CDC process?
+
+Before starting the snapshot, we capture current lsn with `pg_current_wal_lsn`.
+The single value returned by SELECT pg_current_wal_lsn() represents the absolute location of the last point the primary server has written to the Write-Ahead Log (WAL).
+
+
+```
+Timeline:
+─────────────────────────────────────────────────────────────►
+         │                    │                    │
+         T0                   T1                   T2
+    Snapshot LSN         Snapshot End         Current Time
+    (0/12345678)
+         │                    │                    │
+         ├────────────────────┤────────────────────►
+         │   Snapshot Data    │    CDC Data        │
+         │   (goes to handler)│  (goes to handler) │
+         │                    │                    │
+         │◄───────────────────┤                    │
+         No overlap!    CDC starts from snapshot LSN
+```
+
+We are using this value in the slot stream start
+
+`START_REPLICATION SLOT cdc_slot LOGICAL 0/12345678`
+
+Simply, all rows selected during snapshot are guaranteed to be visible as of the snapshot’s MVCC view; any later changes will appear as logical replication events after we start CDC at the stored LSN.
+
+## Snapshot Lifecycle
+
+The snapshot process consists of 5 phases:
+
+### Phase 1: Coordinator Election
+
+```
+Instance1 ──pg_try_advisory_lock()──► Success (Coordinator) ✓
+Instance2 ──pg_try_advisory_lock()──► Fail (Worker)
+Instance3 ──pg_try_advisory_lock()──► Fail (Worker)
+```
+
+Only one instance becomes the coordinator. Others become workers.
+
+### Phase 2: Metadata Creation (Coordinator Only)
+
+```sql
+-- Capture current LSN
+SELECT pg_current_wal_lsn(); -- → 0/12345678
+
+-- Create job metadata  
+INSERT INTO cdc_snapshot_job (...);
+
+-- Split tables into chunks
+-- Table "users": 1M rows → 10 chunks (100K each)
+INSERT INTO cdc_snapshot_chunks (...);
+```
+
+### Phase 3: Snapshot Export (Coordinator Only)
+
+```sql
+BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SELECT pg_export_snapshot(); -- → "00000003-00000002-1"
+-- Keep transaction OPEN! (critical)
+UPDATE cdc_snapshot_job SET snapshot_id = '00000003-00000002-1';
+-- Workers can now join using this snapshot_id
+```
+
+After that, the coordinator simply acts as another worker.
+
+### Phase 4: Chunk Processing (All Instances in Parallel)
+
+```
+Worker Loop:
+┌─► Claim next chunk (SELECT FOR UPDATE SKIP LOCKED)
+│   ├─► BEGIN TRANSACTION
+│   ├─► SET TRANSACTION SNAPSHOT 'snapshot_id'
+│   ├─► SELECT * FROM table WHERE id >= X AND id <= Y
+│   ├─► Send DATA events to handler
+│   ├─► COMMIT
+│   ├─► Mark chunk completed
+└───┴── Repeat until no chunks left
+```
+
+### Phase 5: CDC Continuation
+
+- All chunks completed → Snapshot transaction closed
+- CDC starts from snapshot LSN (`START_REPLICATION SLOT ... LOGICAL 0/12345678`)
+- **No duplicate data!** Snapshot ends where CDC begins.
+
+### Crash Recovery
+
+What happens if an instance crashes during snapshot?
+
+**Worker Crash**: The chunk being processed becomes "stale" after `claimTimeout` (e.g., 30s). Another instance automatically reclaims and reprocesses it.
+
+```
+Before Crash:
+  C0: completed ✓    C3: pending
+  C1: completed ✓    C4: pending  
+  C2: in_progress ← crashed here
+
+After Restart (30s later):
+  C2 becomes stale → reclaimed by healthy instance
+```
+
+When worker is live, it resumes from where it left off - completed chunks are skipped, pending chunks are processed.
+
+**Coordinator Crash Before Export**: Incomplete job is detected on restart. The system cleans up and **restarts snapshot from scratch**.
+
 ---
 
+## Summary
 
-repeatable read transaction level
-pg export snapshot
-pg_current_wal_lsn() 
+The Snapshot Feature provides a robust, scalable solution for initial data capture:
 
-advisory lock
-healtcheck chunk claim
-cdc continiation
+- ✅ **Zero Data Loss**: Consistent snapshot + CDC continuation
+- ✅ **Scalable**: Chunk-based, multi-instance parallel processing  
+- ✅ **Resilient**: Automatic crash recovery
+- ✅ **Observable**: Metadata tables for progress tracking
+
+For more details, check out the [go-pq-cdc repository](https://github.com/Trendyol/go-pq-cdc).
+
+---
