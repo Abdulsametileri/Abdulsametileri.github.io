@@ -3,6 +3,10 @@ languageCode: en-us
 title: Abdulsamet's Blog
 theme: ["PaperMod"]
 
+services:
+  googleAnalytics:
+    id: "G-6KKCPG75GY" 
+
 languages:
   en:
     languageName: "English"
